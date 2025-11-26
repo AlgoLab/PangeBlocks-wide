@@ -1,0 +1,23 @@
+[package]
+name = "graph-align"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.98"
+argmin = { version = "0.10.0", features = ["ctrlc", "rayon"] }
+argmin-observer-slog = "0.1.0"
+bio = "2.2.0"
+bstr = "1.12.0"
+clap = { version = "4.5.32", features = ["derive"] }
+flate2 = "1.1.2"
+gfa = "0.10.1"
+limit-alloc = "0.1.0"
+petgraph = "0.6.5"
+rand = "0.9.1"
+rand_xoshiro = "0.7.0"
+rayon = "1.10.0"
+russcip = { version = "0.8.2", features = ["bundled"] }
+speedytree = "0.1.0"
+tempfile = "3.21.0"
+rs-gax = {path = "../rs-gax"}
