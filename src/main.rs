@@ -1,23 +1,27 @@
 use bio::io::fasta;
 use bstr::io::BufReadExt;
 use clap::Parser;
-use gfa::{gfa::GFA, optfields::OptField, parser::GFAParser};
-use limit_alloc::ConstLimit;
+use gfa::{
+    gfa::{name_conversion::NameMap, Orientation, GFA},
+    optfields::OptField,
+    parser::GFAParser,
+    writer::write_gfa,
+};
 use petgraph::{graph::NodeIndex, Undirected};
 use rayon::prelude::*;
 use speedytree::{DistanceMatrix, NeighborJoiningSolver, RapidBtrees};
 use std::{
-    alloc::System,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     error::Error,
-    io::{self, stdout, BufReader},
+    io::{stdout, BufReader},
     ops::{Deref, DerefMut},
 };
 
 mod minigraph;
+mod post_process;
 
-#[global_allocator]
-static ALLOCATOR: ConstLimit<System, 5_000_000_000> = ConstLimit::new(System);
+// #[global_allocator]
+// static ALLOCATOR: ConstLimit<System, 5_000_000_000> = ConstLimit::new(System);
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -26,141 +30,143 @@ struct Args {
     fasta: String,
     #[arg(short)]
     k: usize,
+    #[arg(long, short)]
+    graph: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Graph {
-    vertices: Vec<String>,
-    adj_list: Vec<Vec<usize>>,
+type Graph = GFA<Vec<u8>, Vec<OptField>>;
+
+trait GraphExt {
+    fn longest_path_oriented(&self) -> Vec<(&[u8], bool)>;
+    fn reconstruct_path_seq(&self, path: &[(&[u8], bool)]) -> String;
+    fn contract_empty_vertices(&mut self);
+    fn from_bytes(data: &[u8]) -> Graph;
+    fn write(&self, sink: &mut impl std::io::Write) -> std::io::Result<()>;
 }
 
-impl Graph {
-    /// Finds the longest simple (non-cyclic) path
-    fn longest_path(&self) -> Vec<usize> {
-        let n = self.vertices.len();
-        let mut stack = vec![false; n];
-        let mut memo: Vec<Option<Vec<usize>>> = vec![None; n];
+impl GraphExt for Graph {
+    fn longest_path_oriented(&self) -> Vec<(&[u8], bool)> {
+        let n = self.segments.len();
 
-        let mut best_path = Vec::new();
+        // Build direct edges with linear name matching:
+        // (from_idx, to_idx, to_orient)
+        let mut edges: Vec<(usize, usize, bool)> = Vec::new();
 
-        for v in 0..n {
-            let path = Self::dfs(v, &self.adj_list, &mut stack, &mut memo);
-            if path.len() > best_path.len() {
-                best_path = path;
+        let name_map = NameMap::build_from_gfa(self);
+        for link in &self.links {
+            let from_idx = name_map
+                .map_name(&link.from_segment)
+                .expect("Segment name not found in graph");
+            let to_idx = name_map
+                .map_name(&link.to_segment)
+                .expect("Segment name not found in graph");
+            edges.push((from_idx, to_idx, link.to_orient == Orientation::Forward));
+        }
+
+        let mut best_path: Vec<(usize, bool)> = Vec::new();
+
+        // DFS-from-every-node using explicit stack (no recursion)
+        for start in 0..n {
+            // stack frame:
+            // (node, orient, next-edge-index, path, visited)
+            let mut stack: Vec<(usize, bool, usize, Vec<(usize, bool)>, Vec<bool>)> = Vec::new();
+
+            let mut visited = vec![false; n];
+            visited[start] = true;
+
+            stack.push((start, true, 0, vec![(start, true)], visited));
+
+            while let Some((node, orient, mut e_i, path, visited)) = stack.pop() {
+                if path.len() > best_path.len() {
+                    best_path = path.clone();
+                }
+
+                // scan entire edge list to find outgoing edges
+                while e_i < edges.len() {
+                    let (f, t, t_orient) = edges[e_i];
+                    e_i += 1;
+
+                    if f == node && !visited[t] {
+                        let mut next_path = path.clone();
+                        next_path.push((t, t_orient));
+
+                        let mut next_visit = visited.clone();
+                        next_visit[t] = true;
+
+                        // Push continuation frame to resume after this edge
+                        stack.push((node, orient, e_i, path, visited));
+
+                        // Push next node
+                        stack.push((t, t_orient, 0, next_path, next_visit));
+                        break;
+                    }
+                }
             }
         }
 
         best_path
-    }
-
-    fn dfs(
-        node: usize,
-        adj: &Vec<Vec<usize>>,
-        stack: &mut Vec<bool>,
-        memo: &mut Vec<Option<Vec<usize>>>,
-    ) -> Vec<usize> {
-        if let Some(cached) = &memo[node] {
-            return cached.clone();
-        }
-
-        if stack[node] {
-            return vec![node];
-        }
-
-        stack[node] = true;
-
-        let mut best = vec![node];
-        for &next in &adj[node] {
-            if !stack[next] {
-                let mut candidate = Self::dfs(next, adj, stack, memo);
-                if candidate.len() + 1 > best.len() {
-                    let mut new_path = vec![node];
-                    new_path.append(&mut candidate);
-                    best = new_path;
-                }
-            }
-        }
-
-        stack[node] = false;
-        memo[node] = Some(best.clone());
-        best
-    }
-
-    pub fn contract_empty_vertices(&mut self) {
-        // compute reverse adj_list
-        let mut reverse_adj_list = vec![Vec::new(); self.vertices.len()];
-        for (u, neighbors) in self.adj_list.iter().enumerate() {
-            for &v in neighbors {
-                reverse_adj_list[v].push(u);
-            }
-        }
-
-        // collect empty vertices
-        let empty: HashSet<usize> = self
-            .vertices
             .iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_empty())
-            .map(|(i, _)| i)
-            .collect();
-
-        // create mapping old->new index for non-empty vertices
-        let mut old_to_new = HashMap::new();
-        let mut new_vertices = Vec::new();
-        let mut next_idx = 0;
-
-        for (i, v) in self.vertices.iter().enumerate() {
-            if !empty.contains(&i) {
-                old_to_new.insert(i, next_idx);
-                new_vertices.push(v.clone());
-                next_idx += 1;
-            }
-        }
-
-        // build new adjacency structures
-        let mut new_adj: Vec<HashSet<usize>> = vec![HashSet::new(); new_vertices.len()];
-        let mut new_rev: Vec<HashSet<usize>> = vec![HashSet::new(); new_vertices.len()];
-
-        for i in 0..self.vertices.len() {
-            if empty.contains(&i) {
-                // Stitch predecessors to successors
-                for &pred in &reverse_adj_list[i] {
-                    if empty.contains(&pred) {
-                        continue;
-                    }
-                    for &succ in &self.adj_list[i] {
-                        if empty.contains(&succ) {
-                            continue;
-                        }
-                        let np = old_to_new[&pred];
-                        let ns = old_to_new[&succ];
-                        if np != ns {
-                            new_adj[np].insert(ns);
-                            new_rev[ns].insert(np);
-                        }
-                    }
-                }
-            } else {
-                // Copy normal edges that don't go through empty nodes
-                let ni = old_to_new[&i];
-                for &succ in &self.adj_list[i] {
-                    if !empty.contains(&succ) {
-                        let ns = old_to_new[&succ];
-                        new_adj[ni].insert(ns);
-                        new_rev[ns].insert(ni);
-                    }
-                }
-            }
-        }
-
-        self.vertices = new_vertices;
-        self.adj_list = new_adj
-            .into_iter()
-            .map(|s| s.into_iter().collect())
-            .collect();
+            .map(|&(idx, o)| (self.segments[idx].name.as_ref(), o))
+            .collect()
     }
 
-    pub fn from_gfa(data: &[u8]) -> Graph {
+    /// Convert a path of (index, orientation) to a full sequence
+    fn reconstruct_path_seq(&self, path: &[(&[u8], bool)]) -> String {
+        let name_map = NameMap::build_from_gfa(self);
+        let mut seq = String::new();
+        for &(name, forward) in path {
+            let idx = name_map
+                .map_name(name)
+                .expect("Segment name not found in graph");
+            let s = std::str::from_utf8(&self.segments[idx].sequence).unwrap();
+            if forward {
+                seq.push_str(s);
+            } else {
+                seq.push_str(&revcomp_str(s));
+            }
+        }
+        seq
+    }
+
+    fn contract_empty_vertices(&mut self) {
+        for i in 0..self.segments.len() {
+            if !self.segments[i].sequence.is_empty() {
+                continue;
+            }
+
+            let name = self.segments[i].name.clone();
+            // Find incoming and outgoing links
+            let incoming: Vec<_> = self
+                .links
+                .iter()
+                .filter(|link| link.to_segment == name)
+                .cloned()
+                .collect();
+            let outgoing: Vec<_> = self
+                .links
+                .iter()
+                .filter(|link| link.from_segment == name)
+                .cloned()
+                .collect();
+
+            // Create new links bypassing the empty vertex
+            for in_link in &incoming {
+                for out_link in &outgoing {
+                    let new_link = gfa::gfa::Link {
+                        from_segment: in_link.from_segment.clone(),
+                        from_orient: in_link.from_orient,
+                        to_segment: out_link.to_segment.clone(),
+                        to_orient: out_link.to_orient,
+                        overlap: b"0M".to_vec(),
+                        optional: Vec::new(),
+                    };
+                    self.links.push(new_link);
+                }
+            }
+        }
+    }
+
+    fn from_bytes(data: &[u8]) -> Self {
         let parser = GFAParser::new();
         let tolerance = Default::default();
         let mut gfa: GFA<Vec<u8>, Vec<OptField>> = GFA::new();
@@ -172,41 +178,13 @@ impl Graph {
                 Err(err) => panic!("Error parsing GFA line: {}", err),
             };
         }
-
-        let mut graph = Graph::default();
-        let mut id_to_idx: HashMap<Vec<u8>, usize> = HashMap::new();
-
-        // Segments → vertices
-        for (i, seg) in gfa.segments.iter().enumerate() {
-            let sequence = String::from_utf8(seg.sequence.clone()).unwrap();
-            graph.vertices.push(sequence);
-            id_to_idx.insert(seg.name.clone(), i);
-            graph.adj_list.push(Vec::new());
-        }
-
-        // Links → adjacency list
-        for link in gfa.links.iter() {
-            let from = *id_to_idx.get(&link.from_segment).unwrap();
-            let to = *id_to_idx.get(&link.to_segment).unwrap();
-            graph.adj_list[from].push(to);
-        }
-        graph
+        gfa
     }
 
-    fn write_to_gfa(&self, sink: &mut impl io::Write) -> io::Result<()> {
-        writeln!(sink, "H\tVN:Z:1.0")?;
-
-        for (i, v) in self.vertices.iter().enumerate() {
-            writeln!(sink, "S\t{}\t{}", i + 1, v)?;
-        }
-
-        for (i, neighbors) in self.adj_list.iter().enumerate() {
-            for &j in neighbors {
-                writeln!(sink, "L\t{}\t+\t{}\t+\t0M", i + 1, j + 1)?;
-            }
-        }
-
-        Ok(())
+    fn write(&self, sink: &mut impl std::io::Write) -> std::io::Result<()> {
+        let mut b = String::new();
+        write_gfa(self, &mut b);
+        sink.write_all(b.as_bytes())
     }
 }
 
@@ -218,33 +196,31 @@ enum TreeNode {
     Empty,
 }
 
-impl std::fmt::Display for TreeNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TreeNode::Leaf(s) => write!(f, "Leaf({})", s.len()),
-            TreeNode::Internal(g) => {
-                write!(f, "Graph({})", g.vertices.len())
-            }
-            TreeNode::Empty => write!(f, "Empty"),
-        }
-    }
-}
-
 type Tree = petgraph::Graph<TreeNode, f64, Undirected>;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let Args { fasta, k, .. } = args;
+    let Args {
+        fasta, k, graph, ..
+    } = args;
 
     let data = fasta::Reader::from_file(&fasta)?;
-    let records: Vec<fasta::Record> = data.records().take(50).collect::<Result<_, _>>()?;
+    let records: Vec<fasta::Record> = data.records().collect::<Result<_, _>>()?;
+
+    if let Some(graph_path) = graph {
+        let data = std::fs::read(&graph_path)?;
+        let graph = Graph::from_bytes(&data);
+        let new_graph = post_process::post_process_graph(graph, &records);
+        new_graph.write(&mut stdout())?;
+        return Ok(());
+    }
 
     let distance_matrix = {
         let kmers_set: Vec<_> = (&records)
             .into_par_iter()
             .enumerate()
             .map(|(i, record)| {
-                println!("Processing record {}", i);
+                eprintln!("Processing record {}", i);
                 extract_kmers(record.seq(), k)
             })
             .collect();
@@ -258,7 +234,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         DistanceMatrix::build(matrix, labels.clone())?
     };
 
-    println!("Building tree");
+    eprintln!("Building tree");
     let nj_tree = NeighborJoiningSolver::<RapidBtrees>::default(distance_matrix).solve()?;
 
     let mut tree = Tree::new_undirected();
@@ -280,14 +256,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .find(|node| tree.neighbors(*node).count() == 3)
         .unwrap();
 
-    println!("Aligning");
+    eprintln!("Aligning");
     dfs(&mut tree, root, None);
 
     match tree.node_weight(root).unwrap() {
         TreeNode::Leaf(_) => panic!("Final node is a leaf"),
         TreeNode::Empty => panic!("Final node is empty"),
         TreeNode::Internal(graph) => {
-            graph.write_to_gfa(&mut stdout()).unwrap();
+            // post_process::post_process_graph(graph.clone(), &records);
+            graph.write(&mut stdout())?;
         }
     }
 
@@ -300,7 +277,6 @@ fn dfs(tree: &mut Tree, node: NodeIndex, parent: Option<NodeIndex>) {
         .filter(|&n| Some(n) != parent)
         .collect();
 
-    // recursively process children in parallel
     for &child in &children {
         dfs(tree, child, Some(node));
     }
@@ -336,15 +312,15 @@ fn align(a: &TreeNode, b: &TreeNode) -> Graph {
     match (a, b) {
         (TreeNode::Empty, _) | (_, TreeNode::Empty) => unreachable!(),
         (TreeNode::Leaf(a), TreeNode::Internal(b)) | (TreeNode::Internal(b), TreeNode::Leaf(a)) => {
-            println!("Sequence Graph alignment");
+            eprintln!("Sequence Graph alignment");
             minigraph::align_seq_graph(a, b)
         }
         (TreeNode::Internal(a), TreeNode::Internal(b)) => {
-            println!("Graph Graph alignment");
+            eprintln!("Graph Graph alignment");
             minigraph::align_graph(a, b)
         }
         (TreeNode::Leaf(a), TreeNode::Leaf(b)) => {
-            println!("Sequence Sequence alignment");
+            eprintln!("Sequence Sequence alignment");
             minigraph::align_seq_seq(a, b)
         }
     }
@@ -382,7 +358,7 @@ fn extract_kmers(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
     for i in 0..seq.len() - k {
         // make kmer canonical
         let kmer = &seq[i..i + k];
-        let rc = revcomp(kmer);
+        let rc = revcomp_bytes(kmer);
         // pick lexicographically smaller
         let canonical = if kmer <= rc.as_slice() {
             kmer.to_vec()
@@ -394,7 +370,7 @@ fn extract_kmers(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
     }
     kmers
 }
-fn revcomp(seq: &[u8]) -> Vec<u8> {
+fn revcomp_bytes(seq: &[u8]) -> Vec<u8> {
     seq.iter()
         .rev()
         .map(|&b| match b {
@@ -402,9 +378,13 @@ fn revcomp(seq: &[u8]) -> Vec<u8> {
             b'C' | b'c' => b'G',
             b'G' | b'g' => b'C',
             b'T' | b't' => b'A',
-            _ => b'N',
+            other => other,
         })
         .collect()
+}
+
+fn revcomp_str(seq: &str) -> String {
+    String::from_utf8(revcomp_bytes(seq.as_bytes())).unwrap()
 }
 
 #[derive(Debug, Clone)]

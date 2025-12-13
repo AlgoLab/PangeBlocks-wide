@@ -1,39 +1,48 @@
 use gax::gaf::GafRecord;
+use gfa::cigar::{CIGAROp, CIGAR};
+use gfa::gfa::name_conversion::NameMap;
+use gfa::gfa::{Header, Link, Segment};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{io::Write, process::Command};
 use tempfile::NamedTempFile;
 
+use crate::{Graph, GraphExt};
+
 static QUERY_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub fn align_graph(a: &crate::Graph, b: &crate::Graph) -> crate::Graph {
+pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
     // choose a representative sequence from graph a
-    let repr_path = a.longest_path();
-    let repr = repr_path
-        .iter()
-        .map(|&i| &a.vertices[i])
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("");
+    eprintln!("here");
+    let repr_path = a.longest_path_oriented();
+    eprintln!("there");
+    let repr = a.reconstruct_path_seq(&repr_path);
+
+    eprintln!("Starting minigraph alignment with seq of length {}", repr.len());
 
     // call minigraph and parse the output
-    let mut graph: crate::Graph = align_seq_graph(&repr, b);
+    let mut graph: Graph = align_seq_graph(&repr, b);
+    eprintln!("Minigraph is done building the graph");
 
-    // align repr on new graph
-    let mut repr_file = NamedTempFile::new().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
 
+    // write representative sequence to file
     let id = QUERY_COUNTER.fetch_add(1, Ordering::SeqCst);
-    write!(repr_file, ">query{}\n{}", id, repr).unwrap();
-
-    let mut graph_file = NamedTempFile::new().unwrap();
-    graph.write_to_gfa(&mut graph_file).unwrap();
-
+    let repr_filepath = temp_dir.path().join("repr.fa");
+    let mut repr_file = File::create(&repr_filepath).unwrap();
+    write!(repr_file, ">query{}\n{}\n", id, repr).unwrap();
     repr_file.flush().unwrap();
+
+    // write graph to file
+    let graph_filepath = temp_dir.path().join("graph.gfa");
+    let mut graph_file = File::create(&graph_filepath).unwrap();
+    graph.write(&mut graph_file).unwrap();
     graph_file.flush().unwrap();
 
-    let out_file = NamedTempFile::new().unwrap();
-    Command::new("GraphAligner")
+    let out_path = temp_dir.path().join("out.gaf");
+
+    let output = Command::new("/home/matteo/miniconda3/bin/GraphAligner")
         .args(["--seeds-minimizer-ignore-frequent", "0.0"])
         .args(["--seeds-minimizer-density", "-1"])
         .args(["--seeds-extend-density", "-1"])
@@ -42,277 +51,220 @@ pub fn align_graph(a: &crate::Graph, b: &crate::Graph) -> crate::Graph {
         .args(["--tangle-effort", "-1"])
         .args(["--precise-clipping", "0.9"])
         .arg("-g")
-        .arg(graph_file.path())
+        .arg(&graph_filepath)
         .arg("-f")
-        .arg(repr_file.path())
+        .arg(&repr_filepath)
         .arg("-a")
-        .arg(out_file.path())
+        .arg(&out_path)
         .args(["-x", "vg"])
         .output()
         .expect("failed to execute GraphAligner");
 
-    let gaf_file = File::open(out_file.path()).unwrap();
+    eprintln!(
+        "GraphAligner stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    eprintln!("GraphAligner is done aligning");
+
+    let gaf_file = File::open(out_path).unwrap();
     let gaf = gax::gaf::parse(gaf_file).unwrap();
+    assert!(!gaf.is_empty());
 
-    // compute reverse adj_list
-    let n = a.vertices.len();
-    let mut a_reverse_adj_list = vec![Vec::new(); n];
-    for (u, neighbors) in a.adj_list.iter().enumerate() {
-        for &v in neighbors {
-            a_reverse_adj_list[v].push(u);
-        }
+    if gaf.iter().any(|r| r.strand == '-') {
+        panic!("GraphAligner produced reverse strand alignments, which is not supported yet.");
     }
 
-    let mut mapping = build_mapping(a, &graph, &repr_path, &gaf);
-    let mut old_to_new: HashMap<usize, usize> = HashMap::new();
-    let mut added_back: HashSet<usize> = HashSet::new();
-    let mut added_forw: HashSet<usize> = HashSet::new();
+    // where is the representitive sequence mapped in the old graph?
+    let mapping_repr_to_old: Vec<(&[u8], usize)> = build_mapping_seq_to_old(a, repr_path, &repr);
 
-    for (&node, mapping_i) in repr_path.iter().zip(0..mapping.len()) {
-        let Some(MapEntry {
-            start_node,
-            start_offset,
-            end_node,
-            end_offset,
-        }) = mapping[mapping_i]
-        else {
-            continue;
-        };
+    // println!("old mapping:");
+    // for (s, i) in mapping_repr_to_old.iter() {
+    //     let s_str = std::str::from_utf8(s).unwrap();
+    //     println!("  ({},{})", s_str, i);
+    // }
 
-        if !(start_node < graph.vertices.len()
-            && end_node < graph.vertices.len()
-            && start_offset <= graph.vertices[start_node].len()
-            && end_offset <= graph.vertices[end_node].len())
-        {
-            println!("Skipping node {} due to invalid mapping", node);
-            println!("{:#?}", mapping[mapping_i]);
-            println!("vertices len {}", graph.vertices.len());
-            println!("start node len {}", graph.vertices[start_node].len());
-            println!("end node len {}", graph.vertices[end_node].len());
-            panic!();
-        }
+    let mapping_repr_to_new: Vec<Option<(Vec<u8>, usize)>> =
+        build_mapping_seq_to_new(repr, &graph, gaf)
+            .into_iter()
+            .map(|x| x.map(|(s, o)| (s.to_vec(), o)))
+            .collect();
 
-        let new_root = if start_offset > 0 {
-            // split the start_node in the new graph at start_offset
-            split_node(&mut graph, start_node, start_offset, &mut mapping)
-        } else {
-            start_node
-        };
-        old_to_new.insert(node, new_root);
+    // println!("new mapping:");
+    // for x in mapping_repr_to_new.iter() {
+    //     match x {
+    //         Some((s, i)) => {
+    //             let s_str = std::str::from_utf8(s).unwrap();
+    //             println!("  ({},{})", s_str, i);
+    //         }
+    //         None => {
+    //             println!("  None");
+    //         }
+    //     }
+    // }
 
-        // explore backwards in the old graph and add edges
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            for &prev in &a_reverse_adj_list[current] {
-                if repr_path.contains(&prev) || added_back.contains(&prev) {
-                    continue;
-                }
-                added_back.insert(prev);
-                let new_node = if let Some(&new_node) = old_to_new.get(&prev) {
-                    new_node
-                } else {
-                    // node needs to be added
-                    graph.vertices.push(a.vertices[prev].clone());
-                    graph.adj_list.push(vec![]);
-                    old_to_new.insert(prev, graph.vertices.len() - 1);
-                    graph.vertices.len() - 1
-                };
-                graph.adj_list[new_node].push(old_to_new[&current]);
-                stack.push(prev);
-            }
-        }
-
-        let new_root = if end_offset < graph.vertices[end_node].len() {
-            // split the end_node in the new graph at end_offset
-            split_node(&mut graph, end_node, end_offset, &mut mapping)
-        } else {
-            end_node
-        };
-        old_to_new.insert(node, new_root);
-
-        // explore forwards
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            for &next in &a.adj_list[current] {
-                if repr_path.contains(&next) || added_forw.contains(&next) {
-                    continue;
-                }
-                added_forw.insert(next);
-                let new_node = if let Some(&new_node) = old_to_new.get(&next) {
-                    new_node
-                } else {
-                    // node needs to be added
-                    graph.vertices.push(a.vertices[next].clone());
-                    graph.adj_list.push(vec![]);
-                    old_to_new.insert(next, graph.vertices.len() - 1);
-                    graph.vertices.len() - 1
-                };
-                graph.adj_list[old_to_new[&current]].push(new_node);
-                stack.push(next);
-            }
-        }
-    }
-
-    // remove empty nodes
-    graph.contract_empty_vertices();
+    merge_graph_a_into_b(a, &mut graph, &mapping_repr_to_old, &mapping_repr_to_new);
 
     graph
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MapEntry {
-    start_node: usize,
-    start_offset: usize,
-    end_node: usize,
-    end_offset: usize,
-}
+fn merge_graph_a_into_b(
+    old_graph: &Graph,
+    new_graph: &mut Graph,
+    mapping_repr_to_old: &[(&[u8], usize)],
+    mapping_repr_to_new: &[Option<(Vec<u8>, usize)>],
+) {
+    assert_eq!(mapping_repr_to_old.len(), mapping_repr_to_new.len());
 
-fn build_mapping(
-    old_graph: &crate::Graph,
-    new_graph: &crate::Graph,
-    repr_path: &[usize],
-    gaf: &[GafRecord],
-) -> Vec<Option<MapEntry>> {
-    let mut mapping: Vec<Option<MapEntry>> = vec![None; repr_path.len()];
+    // A vertex → B vertex
+    let mut a_to_b: HashMap<&[u8], &[u8]> = HashMap::new();
 
-    // compute cumulative start positions of old nodes
-    let mut i = 0;
-    let repr_starts: Vec<usize> = repr_path
-        .iter()
-        .map(|&idx| {
-            let start = i;
-            i += old_graph.vertices[idx].len();
-            start
-        })
-        .collect();
-
-    for ((&node, &query_pos), entry) in repr_path
-        .iter()
-        .zip(repr_starts.iter())
-        .zip(mapping.iter_mut())
-    {
-        let mut start = None;
-        for record in gaf {
-            start = map_query_pos_to_node(record, query_pos, new_graph);
-            if start.is_some() {
-                break;
-            }
-        }
-
-        let mut end = None;
-        for record in gaf {
-            end = map_query_pos_to_node(
-                record,
-                query_pos + old_graph.vertices[node].len(),
-                new_graph,
-            );
-            if end.is_some() {
-                break;
-            }
-        }
-
-        if let (Some((start_node, start_offset)), Some((end_node, end_offset))) = (start, end) {
-            *entry = Some(MapEntry {
-                start_node,
-                start_offset,
-                end_node,
-                end_offset,
-            });
+    // Step 1: infer vertex mapping from aligned positions
+    for ((a_vid, _), b_vid) in mapping_repr_to_old.iter().zip(mapping_repr_to_new.iter()) {
+        let Some((b_vid, _)) = b_vid else {
+            continue;
         };
+        a_to_b.entry(*a_vid).or_insert(b_vid);
     }
 
-    mapping
-}
-
-fn map_query_pos_to_node(
-    record: &GafRecord,
-    target_query_pos: usize,
-    graph: &crate::Graph,
-) -> Option<(usize, usize)> {
-    if target_query_pos < record.query_start as usize
-        || target_query_pos > record.query_end as usize
-    {
-        return None;
-    }
-
-    let cigar_ops = parse_cigar(&record.opt_fields["cg"].1);
-
-    let mut current_query_pos = record.query_start as usize;
-    let mut path_idx = 0;
-    let mut node_offset = 0;
-
-    for op in &cigar_ops {
-        let mut node_idx = record.path[path_idx].name.parse::<usize>().unwrap() - 1;
-        let mut node_len = graph.vertices[node_idx].len();
-
-        match *op {
-            CigarOp::Match(len) | CigarOp::Mismatch(len) => {
-                let query_start = current_query_pos;
-                let query_end = current_query_pos + len;
-
-                if target_query_pos < query_end {
-                    let offset_into_op = target_query_pos - query_start;
-                    let mut ref_offset = node_offset + offset_into_op;
-
-                    // walk forward across nodes if needed
-                    while ref_offset >= node_len {
-                        ref_offset -= node_len;
-                        path_idx += 1;
-                        if path_idx >= record.path.len() {
-                            return None;
-                        }
-                        node_idx = record.path[path_idx].name.parse::<usize>().unwrap() - 1;
-                        node_len = graph.vertices[node_idx].len();
-                    }
-
-                    return Some((node_idx, ref_offset));
-                }
-
-                current_query_pos = query_end;
-                node_offset += len;
-
-                while node_offset >= node_len {
-                    node_offset -= node_len;
-                    path_idx += 1;
-                    if path_idx >= record.path.len() {
-                        return None;
-                    }
-                    node_idx = record.path[path_idx].name.parse::<usize>().unwrap() - 1;
-                    node_len = graph.vertices[node_idx].len();
-                }
-            }
-            CigarOp::Insertion(len) => {
-                current_query_pos += len;
-                if current_query_pos > target_query_pos {
-                    return None;
-                }
-            }
-            CigarOp::Deletion(len) => {
-                node_offset += len;
-                while node_offset >= node_len {
-                    node_offset -= node_len;
-                    path_idx += 1;
-                    if path_idx >= record.path.len() {
-                        return None;
-                    }
-                    node_idx = record.path[path_idx].name.parse::<usize>().unwrap() - 1;
-                    node_len = graph.vertices[node_idx].len();
-                }
-            }
+    // Step 2: create missing vertices in B
+    for a_segment in old_graph.segments.iter() {
+        if !a_to_b.contains_key(&a_segment.name.as_ref()) {
+            let mut b_segment = a_segment.clone();
+            // add unique suffix to the name
+            b_segment.name.extend_from_slice(b"_a");
+            assert!(new_graph.segments.iter().all(|s| s.name != b_segment.name));
+            new_graph.segments.push(b_segment);
+            a_to_b.insert(a_segment.name.as_ref(), a_segment.name.as_ref());
         }
     }
 
-    None
+    // Step 3: copy edges
+    let mut seen_edges = HashSet::new();
+
+    for edge in &old_graph.links {
+        let from_b = a_to_b[&edge.from_segment.as_ref()];
+        let to_b = a_to_b[&edge.to_segment.as_ref()];
+
+        // Avoid duplicate edges
+        if seen_edges.insert((from_b, to_b, edge.overlap.clone())) {
+            let link = Link {
+                from_segment: from_b.to_vec(),
+                from_orient: edge.from_orient,
+                to_segment: to_b.to_vec(),
+                to_orient: edge.to_orient,
+                overlap: edge.overlap.clone(),
+                optional: Vec::new(),
+            };
+            new_graph.links.push(link);
+        }
+    }
 }
 
-pub fn align_seq_graph(a: &str, b: &crate::Graph) -> crate::Graph {
+fn build_mapping_seq_to_new(
+    repr: String,
+    graph: &Graph,
+    gaf: Vec<GafRecord>,
+) -> Vec<Option<(&[u8], usize)>> {
+    // build `mapping_from_repr_to_new` using the GAF
+    let mut mapping_from_repr_to_new: Vec<Option<(&[u8], usize)>> = vec![None; repr.len()];
+    let name_map_new = NameMap::build_from_gfa(graph);
+    for record in gaf {
+        let mut cigar: CIGAR = parse_cigar(&record.opt_fields["cg"].1);
+        for step in record.path {
+            // build mapping for this step using current_cigar
+            let seq_idx = name_map_new
+                .map_name(&step.name)
+                .expect("Name not found in new graph");
+            let seq = graph.segments[seq_idx].sequence.as_slice();
+
+            let mut seq_pos = 0;
+            let mut repr_pos = record.query_start as usize;
+
+            let step_length: usize = match (step.start, step.end) {
+                (Some(start), Some(end)) => (end - start) as usize, // segId
+                _ => seq.len(),                                     // stableIntv or stableId
+            };
+
+            let (current_cigar, rest) = cigar.split_at(step_length);
+            cigar = rest;
+            for (len, op) in current_cigar.iter() {
+                let len = len as usize;
+                match op {
+                    CIGAROp::M | CIGAROp::X => {
+                        // Match | Mismatch
+                        for _ in 0..len {
+                            mapping_from_repr_to_new[repr_pos] = Some((seq, seq_pos));
+                            repr_pos += 1;
+                            seq_pos += 1;
+                        }
+                    }
+                    CIGAROp::I => {
+                        // Insertion
+                        repr_pos += len;
+                    }
+                    CIGAROp::D => {
+                        // Deletion
+                        seq_pos += len;
+                    }
+                    CIGAROp::N => {
+                        // Reference skip
+                        seq_pos += len;
+                    }
+                    CIGAROp::S => {
+                        // Soft clip
+                        repr_pos += len;
+                    }
+                    CIGAROp::H | CIGAROp::P | CIGAROp::E => {
+                        // Hard clip | Padding | Extension
+                    }
+                }
+            }
+        }
+        // assert!(cigar.is_empty(), "CIGAR not fully consumed");
+        if !cigar.is_empty() {
+            eprintln!(
+                "Warning: CIGAR not fully consumed for one GAF record. Cigar left={:?}",
+                cigar
+            );
+        }
+    }
+    mapping_from_repr_to_new
+}
+
+fn build_mapping_seq_to_old<'graph>(
+    a: &'graph Graph,
+    repr_path: Vec<(&'graph [u8], bool)>,
+    repr: &String,
+) -> Vec<(&'graph [u8], usize)> {
+    let name_map_old = NameMap::build_from_gfa(a);
+    let mut mapping_from_repr_to_old: Vec<(&[u8], usize)> = Vec::new();
+    for &(name, direction) in &repr_path {
+        let seq_indx = name_map_old.map_name(name).expect("Name not found");
+        let seq = a.segments[seq_indx].sequence.as_slice();
+        let range = 0..seq.len();
+        if direction {
+            for i in range {
+                mapping_from_repr_to_old.push((seq, i));
+            }
+        } else {
+            for i in range.rev() {
+                mapping_from_repr_to_old.push((seq, i));
+            }
+        }
+    }
+    assert_eq!(repr.len(), mapping_from_repr_to_old.len());
+    mapping_from_repr_to_old
+}
+
+pub fn align_seq_graph(a: &str, b: &Graph) -> Graph {
     let mut query = NamedTempFile::new().unwrap();
 
     let id = QUERY_COUNTER.fetch_add(1, Ordering::SeqCst);
     write!(query, ">query{}\n{}", id, a).unwrap();
 
     let mut graph = NamedTempFile::new().unwrap();
-    b.write_to_gfa(&mut graph).unwrap();
+    b.write(&mut graph).unwrap();
 
     query.flush().unwrap();
     graph.flush().unwrap();
@@ -323,75 +275,29 @@ pub fn align_seq_graph(a: &str, b: &crate::Graph) -> crate::Graph {
         .arg(query.path())
         .output()
         .expect("failed to execute minigraph");
-    crate::Graph::from_gfa(&out.stdout[..])
+
+    eprintln!("Minigraph stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    Graph::from_bytes(&out.stdout[..])
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CigarOp {
-    Match(usize),
-    Mismatch(usize),
-    Insertion(usize),
-    Deletion(usize),
-}
-
-fn parse_cigar(cigar: &str) -> Vec<CigarOp> {
-    let mut ops = Vec::new();
-    let mut num = 0;
-
-    for c in cigar.chars() {
-        if c.is_ascii_digit() {
-            num = num * 10 + c.to_digit(10).unwrap() as usize;
-        } else {
-            let op = match c {
-                '=' => CigarOp::Match(num),
-                'X' => CigarOp::Mismatch(num),
-                'I' => CigarOp::Insertion(num),
-                'D' => CigarOp::Deletion(num),
-                _ => panic!("Unexpected CIGAR op: {}", c),
-            };
-            ops.push(op);
-            num = 0;
-        }
-    }
-
-    ops
-}
-
-pub fn align_seq_seq(a: &str, b: &str) -> crate::Graph {
-    let gfa = crate::Graph {
-        vertices: vec![a.to_string()],
-        adj_list: vec![vec![]],
+pub fn align_seq_seq(a: &str, b: &str) -> Graph {
+    let graph = Graph {
+        segments: vec![Segment {
+            name: "seq".into(),
+            sequence: a.as_bytes().to_vec(),
+            optional: Vec::new(),
+        }],
+        links: Vec::new(),
+        paths: Vec::new(),
+        containments: Vec::new(),
+        header: Header::default(),
     };
-    align_seq_graph(b, &gfa)
+
+    // Align `b` onto this one-segment graph
+    align_seq_graph(b, &graph)
 }
 
-/// Split a node in [0, split_point) and [split_point, node.len()).
-/// Returns indices new node index if split happened.
-fn split_node(
-    graph: &mut crate::Graph,
-    node_index: usize,
-    split_point: usize,
-    mapping: &mut [Option<MapEntry>],
-) -> usize {
-    let original = graph.vertices[node_index].clone();
-    graph.vertices[node_index] = original[..split_point].to_string();
-    graph.vertices.push(original[split_point..].to_string());
-    let new_idx = graph.vertices.len() - 1;
-
-    let old_adj = graph.adj_list[node_index].clone();
-    graph.adj_list.push(old_adj);
-    graph.adj_list[node_index] = vec![new_idx];
-
-    for entry in mapping.iter_mut().filter_map(|e| e.as_mut()) {
-        if entry.start_node == node_index && entry.start_offset >= split_point {
-            entry.start_node = new_idx;
-            entry.start_offset -= split_point;
-        }
-        if entry.end_node == node_index && entry.end_offset >= split_point {
-            entry.end_node = new_idx;
-            entry.end_offset -= split_point;
-        }
-    }
-
-    new_idx
+fn parse_cigar(cigar: &str) -> CIGAR {
+    CIGAR::from_bytestring(cigar.as_bytes()).expect("Failed to parse CIGAR")
 }
