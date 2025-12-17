@@ -4,22 +4,20 @@ use gfa::gfa::name_conversion::NameMap;
 use gfa::gfa::{Header, Link, Segment};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{io::Write, process::Command};
 use tempfile::NamedTempFile;
 
 use crate::{Graph, GraphExt};
 
-static QUERY_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
     // choose a representative sequence from graph a
-    eprintln!("here");
     let repr_path = a.longest_path_oriented();
-    eprintln!("there");
     let repr = a.reconstruct_path_seq(&repr_path);
 
-    eprintln!("Starting minigraph alignment with seq of length {}", repr.len());
+    eprintln!(
+        "Starting minigraph alignment with seq of length {}",
+        repr.len()
+    );
 
     // call minigraph and parse the output
     let mut graph: Graph = align_seq_graph(&repr, b);
@@ -28,10 +26,9 @@ pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
     let temp_dir = tempfile::tempdir().unwrap();
 
     // write representative sequence to file
-    let id = QUERY_COUNTER.fetch_add(1, Ordering::SeqCst);
     let repr_filepath = temp_dir.path().join("repr.fa");
     let mut repr_file = File::create(&repr_filepath).unwrap();
-    write!(repr_file, ">query{}\n{}\n", id, repr).unwrap();
+    write!(repr_file, ">query\n{}\n", repr).unwrap();
     repr_file.flush().unwrap();
 
     // write graph to file
@@ -42,14 +39,7 @@ pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
 
     let out_path = temp_dir.path().join("out.gaf");
 
-    let output = Command::new("/home/matteo/miniconda3/bin/GraphAligner")
-        .args(["--seeds-minimizer-ignore-frequent", "0.0"])
-        .args(["--seeds-minimizer-density", "-1"])
-        .args(["--seeds-extend-density", "-1"])
-        .args(["--seeds-mxm-length", "15"])
-        .args(["--bandwidth", "200"])
-        .args(["--tangle-effort", "-1"])
-        .args(["--precise-clipping", "0.9"])
+    let output = Command::new("GraphAligner")
         .arg("-g")
         .arg(&graph_filepath)
         .arg("-f")
@@ -105,6 +95,7 @@ pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
 
     merge_graph_a_into_b(a, &mut graph, &mapping_repr_to_old, &mapping_repr_to_new);
 
+    graph.mass_rename();
     graph
 }
 
@@ -119,7 +110,7 @@ fn merge_graph_a_into_b(
     // A vertex → B vertex
     let mut a_to_b: HashMap<&[u8], &[u8]> = HashMap::new();
 
-    // Step 1: infer vertex mapping from aligned positions
+    // get vertex mapping from aligned positions
     for ((a_vid, _), b_vid) in mapping_repr_to_old.iter().zip(mapping_repr_to_new.iter()) {
         let Some((b_vid, _)) = b_vid else {
             continue;
@@ -127,11 +118,10 @@ fn merge_graph_a_into_b(
         a_to_b.entry(*a_vid).or_insert(b_vid);
     }
 
-    // Step 2: create missing vertices in B
+    // create missing vertices in B
     for a_segment in old_graph.segments.iter() {
         if !a_to_b.contains_key(&a_segment.name.as_ref()) {
             let mut b_segment = a_segment.clone();
-            // add unique suffix to the name
             b_segment.name.extend_from_slice(b"_a");
             assert!(new_graph.segments.iter().all(|s| s.name != b_segment.name));
             new_graph.segments.push(b_segment);
@@ -139,12 +129,15 @@ fn merge_graph_a_into_b(
         }
     }
 
-    // Step 3: copy edges
+    // copy edges
     let mut seen_edges = HashSet::new();
-
     for edge in &old_graph.links {
-        let from_b = a_to_b[&edge.from_segment.as_ref()];
-        let to_b = a_to_b[&edge.to_segment.as_ref()];
+        let Some(from_b) = a_to_b.get(&edge.from_segment.as_ref()) else {
+            continue;
+        };
+        let Some(to_b) = a_to_b.get(&edge.to_segment.as_ref()) else {
+            continue;
+        };
 
         // Avoid duplicate edges
         if seen_edges.insert((from_b, to_b, edge.overlap.clone())) {
@@ -260,8 +253,7 @@ fn build_mapping_seq_to_old<'graph>(
 pub fn align_seq_graph(a: &str, b: &Graph) -> Graph {
     let mut query = NamedTempFile::new().unwrap();
 
-    let id = QUERY_COUNTER.fetch_add(1, Ordering::SeqCst);
-    write!(query, ">query{}\n{}", id, a).unwrap();
+    write!(query, ">query\n{}", a).unwrap();
 
     let mut graph = NamedTempFile::new().unwrap();
     b.write(&mut graph).unwrap();
@@ -270,7 +262,7 @@ pub fn align_seq_graph(a: &str, b: &Graph) -> Graph {
     graph.flush().unwrap();
 
     let out = Command::new("minigraph")
-        .args(["-cxggs"])
+        .arg("-cxggs")
         .arg(graph.path())
         .arg(query.path())
         .output()

@@ -27,14 +27,7 @@ pub fn post_process_graph(mut graph: Graph, records: &[Record]) -> Graph {
         .unwrap();
         repr_file.flush().unwrap();
 
-        Command::new("/home/matteo/miniconda3/bin/GraphAligner")
-            .args(["--seeds-minimizer-ignore-frequent", "0.0"])
-            .args(["--seeds-minimizer-density", "-1"])
-            .args(["--seeds-extend-density", "-1"])
-            .args(["--seeds-mxm-length", "15"])
-            .args(["--bandwidth", "200"])
-            .args(["--tangle-effort", "-1"])
-            .args(["--precise-clipping", "0.9"])
+        Command::new("GraphAligner")
             .arg("-g")
             .arg(&graph_path)
             .arg("-f")
@@ -78,7 +71,7 @@ pub fn post_process_graph(mut graph: Graph, records: &[Record]) -> Graph {
                         && link.to_segment == to_segment
                         && link.to_orient == to_orient
                 }) {
-                    continue;
+                    // continue;
                 }
 
                 // get missing sequence
