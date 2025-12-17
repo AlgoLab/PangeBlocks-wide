@@ -11,7 +11,7 @@ use petgraph::{graph::NodeIndex, Undirected};
 use rayon::prelude::*;
 use speedytree::{DistanceMatrix, NeighborJoiningSolver, RapidBtrees};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     io::{stdout, BufReader},
     ops::{Deref, DerefMut},
@@ -39,76 +39,261 @@ type Graph = GFA<Vec<u8>, Vec<OptField>>;
 trait GraphExt {
     fn longest_path_oriented(&self) -> Vec<(&[u8], bool)>;
     fn reconstruct_path_seq(&self, path: &[(&[u8], bool)]) -> String;
-    fn contract_empty_vertices(&mut self);
     fn from_bytes(data: &[u8]) -> Graph;
     fn write(&self, sink: &mut impl std::io::Write) -> std::io::Result<()>;
+    fn mass_rename(&mut self);
 }
 
 impl GraphExt for Graph {
     fn longest_path_oriented(&self) -> Vec<(&[u8], bool)> {
         let n = self.segments.len();
+        let size = n * 2;
 
-        // Build direct edges with linear name matching:
-        // (from_idx, to_idx, to_orient)
-        let mut edges: Vec<(usize, usize, bool)> = Vec::new();
-
+        let mut adj = vec![Vec::new(); size];
         let name_map = NameMap::build_from_gfa(self);
+
         for link in &self.links {
-            let from_idx = name_map
+            let from = name_map
                 .map_name(&link.from_segment)
-                .expect("Segment name not found in graph");
-            let to_idx = name_map
+                .expect("Segment name not found");
+            let to = name_map
                 .map_name(&link.to_segment)
-                .expect("Segment name not found in graph");
-            edges.push((from_idx, to_idx, link.to_orient == Orientation::Forward));
+                .expect("Segment name not found");
+
+            if !(from < n) {
+                eprintln!(
+                    "from index {} out of range (n = {}) for segment {:?}",
+                    from,
+                    n,
+                    std::str::from_utf8(&link.from_segment),
+                );
+                continue;
+            }
+            if !(to < n) {
+                eprintln!(
+                    "to index {} out of range (n = {}) for segment {:?}",
+                    to,
+                    n,
+                    std::str::from_utf8(&link.from_segment),
+                );
+                continue;
+            }
+
+            // skip backward links for now
+            if (link.from_orient == Orientation::Backward)
+                || (link.to_orient == Orientation::Backward)
+            {
+                continue;
+            }
+
+            let from = from + n * (link.from_orient == Orientation::Forward) as usize;
+            let to = to + n * (link.to_orient == Orientation::Forward) as usize;
+
+            if from >= size || to >= size {
+                eprintln!(
+                    "Skipping invalid link from {} to {} (size = {})",
+                    from, to, size
+                );
+                continue;
+            }
+
+            adj[from].push(to);
         }
 
-        let mut best_path: Vec<(usize, bool)> = Vec::new();
+        let mut indeg = vec![0usize; size];
+        for u in 0..size {
+            for &v in &adj[u] {
+                indeg[v] += 1;
+            }
+        }
 
-        // DFS-from-every-node using explicit stack (no recursion)
-        for start in 0..n {
-            // stack frame:
-            // (node, orient, next-edge-index, path, visited)
-            let mut stack: Vec<(usize, bool, usize, Vec<(usize, bool)>, Vec<bool>)> = Vec::new();
+        let mut queue = VecDeque::new();
+        let mut indeg_kahn = indeg.clone();
 
-            let mut visited = vec![false; n];
-            visited[start] = true;
+        for u in 0..size {
+            if indeg_kahn[u] == 0 {
+                queue.push_back(u);
+            }
+        }
 
-            stack.push((start, true, 0, vec![(start, true)], visited));
-
-            while let Some((node, orient, mut e_i, path, visited)) = stack.pop() {
-                if path.len() > best_path.len() {
-                    best_path = path.clone();
-                }
-
-                // scan entire edge list to find outgoing edges
-                while e_i < edges.len() {
-                    let (f, t, t_orient) = edges[e_i];
-                    e_i += 1;
-
-                    if f == node && !visited[t] {
-                        let mut next_path = path.clone();
-                        next_path.push((t, t_orient));
-
-                        let mut next_visit = visited.clone();
-                        next_visit[t] = true;
-
-                        // Push continuation frame to resume after this edge
-                        stack.push((node, orient, e_i, path, visited));
-
-                        // Push next node
-                        stack.push((t, t_orient, 0, next_path, next_visit));
-                        break;
-                    }
+        let mut topo = Vec::with_capacity(size);
+        while let Some(u) = queue.pop_front() {
+            topo.push(u);
+            for &v in &adj[u] {
+                indeg_kahn[v] -= 1;
+                if indeg_kahn[v] == 0 {
+                    queue.push_back(v);
                 }
             }
         }
 
-        best_path
-            .iter()
-            .map(|&(idx, o)| (self.segments[idx].name.as_ref(), o))
+        let path = {
+            let mut dist = vec![1usize; size];
+            let mut parent = vec![None; size];
+
+            for &u in &topo {
+                for &v in &adj[u] {
+                    if dist[u] + 1 > dist[v] {
+                        dist[v] = dist[u] + 1;
+                        parent[v] = Some(u);
+                    }
+                }
+            }
+
+            let end = (0..size).max_by_key(|&i| dist[i]).unwrap();
+
+            let mut path = Vec::new();
+            let mut cur = Some(end);
+            while let Some(u) = cur {
+                path.push(u);
+                cur = parent[u];
+            }
+            path.reverse();
+            path
+        };
+
+        path.into_iter()
+            .map(|idx| {
+                let segment_idx = idx % n;
+                let forward = idx >= n;
+                (&self.segments[segment_idx].name[..], forward)
+            })
             .collect()
     }
+    /*
+         // safe and slow version
+        fn longest_path_oriented(&self) -> Vec<(&[u8], bool)> {
+            let n = self.segments.len();
+            let size = n * 2;
+
+            let mut adj = vec![Vec::new(); size];
+            let name_map = NameMap::build_from_gfa(self);
+
+            for link in &self.links {
+                let from = name_map
+                    .map_name(&link.from_segment)
+                    .expect("Segment name not found");
+                let to = name_map
+                    .map_name(&link.to_segment)
+                    .expect("Segment name not found");
+
+                assert!(
+                    from < n,
+                    "from index {} out of range (n = {}) for segment {:?}",
+                    from,
+                    n,
+                    std::str::from_utf8(&link.from_segment)
+                );
+                assert!(
+                    to < n,
+                    "to index {} out of range (n = {}) for segment {:?}",
+                    to,
+                    n,
+                    std::str::from_utf8(&link.to_segment)
+                );
+
+                let from = from + n * (link.from_orient == Orientation::Forward) as usize;
+                let to = to + n * (link.to_orient == Orientation::Forward) as usize;
+
+                adj[from].push(to);
+            }
+
+            let mut indeg = vec![0usize; size];
+            for u in 0..size {
+                for &v in &adj[u] {
+                    indeg[v] += 1;
+                }
+            }
+
+            let mut queue = VecDeque::new();
+            let mut indeg_kahn = indeg.clone();
+
+            for u in 0..size {
+                if indeg_kahn[u] == 0 {
+                    queue.push_back(u);
+                }
+            }
+
+            let mut topo = Vec::with_capacity(size);
+            while let Some(u) = queue.pop_front() {
+                topo.push(u);
+                for &v in &adj[u] {
+                    indeg_kahn[v] -= 1;
+                    if indeg_kahn[v] == 0 {
+                        queue.push_back(v);
+                    }
+                }
+            }
+
+            let path = if topo.len() == size {
+                let mut dist = vec![1usize; size];
+                let mut parent = vec![None; size];
+
+                for &u in &topo {
+                    for &v in &adj[u] {
+                        if dist[u] + 1 > dist[v] {
+                            dist[v] = dist[u] + 1;
+                            parent[v] = Some(u);
+                        }
+                    }
+                }
+
+                let end = (0..size).max_by_key(|&i| dist[i]).unwrap();
+
+                let mut path = Vec::new();
+                let mut cur = Some(end);
+                while let Some(u) = cur {
+                    path.push(u);
+                    cur = parent[u];
+                }
+                path.reverse();
+                path
+            } else {
+                eprintln!("Graph has cycles, using DFS for longest path");
+
+                fn dfs(
+                    u: usize,
+                    adj: &Vec<Vec<usize>>,
+                    visited: &mut Vec<bool>,
+                    path: &mut Vec<usize>,
+                    best: &mut Vec<usize>,
+                ) {
+                    visited[u] = true;
+                    path.push(u);
+
+                    if path.len() > best.len() {
+                        *best = path.clone();
+                    }
+
+                    for &v in &adj[u] {
+                        if !visited[v] {
+                            dfs(v, adj, visited, path, best);
+                        }
+                    }
+
+                    path.pop();
+                    visited[u] = false;
+                }
+
+                let mut visited = vec![false; size];
+                let mut path = Vec::new();
+                let mut best = Vec::new();
+
+                for u in 0..size {
+                    dfs(u, &adj, &mut visited, &mut path, &mut best);
+                }
+                best
+            };
+
+            path.into_iter()
+                .map(|idx| {
+                    let segment_idx = idx % n;
+                    let forward = idx >= n;
+                    (&self.segments[segment_idx].name[..], forward)
+                })
+                .collect()
+        }
+    */
 
     /// Convert a path of (index, orientation) to a full sequence
     fn reconstruct_path_seq(&self, path: &[(&[u8], bool)]) -> String {
@@ -122,48 +307,10 @@ impl GraphExt for Graph {
             if forward {
                 seq.push_str(s);
             } else {
-                seq.push_str(&revcomp_str(s));
+                seq.push_str(&String::from_utf8(revcomp(s)).unwrap());
             }
         }
         seq
-    }
-
-    fn contract_empty_vertices(&mut self) {
-        for i in 0..self.segments.len() {
-            if !self.segments[i].sequence.is_empty() {
-                continue;
-            }
-
-            let name = self.segments[i].name.clone();
-            // Find incoming and outgoing links
-            let incoming: Vec<_> = self
-                .links
-                .iter()
-                .filter(|link| link.to_segment == name)
-                .cloned()
-                .collect();
-            let outgoing: Vec<_> = self
-                .links
-                .iter()
-                .filter(|link| link.from_segment == name)
-                .cloned()
-                .collect();
-
-            // Create new links bypassing the empty vertex
-            for in_link in &incoming {
-                for out_link in &outgoing {
-                    let new_link = gfa::gfa::Link {
-                        from_segment: in_link.from_segment.clone(),
-                        from_orient: in_link.from_orient,
-                        to_segment: out_link.to_segment.clone(),
-                        to_orient: out_link.to_orient,
-                        overlap: b"0M".to_vec(),
-                        optional: Vec::new(),
-                    };
-                    self.links.push(new_link);
-                }
-            }
-        }
     }
 
     fn from_bytes(data: &[u8]) -> Self {
@@ -185,6 +332,37 @@ impl GraphExt for Graph {
         let mut b = String::new();
         write_gfa(self, &mut b);
         sink.write_all(b.as_bytes())
+    }
+
+    fn mass_rename(&mut self) {
+        let mut id = 0;
+        let mut name_map = HashMap::new();
+        for segment in self.segments.iter_mut() {
+            let old_name = segment.name.clone();
+            let new_name = format!("s{}", id);
+            name_map.insert(old_name, new_name.clone());
+            segment.name = new_name.into_bytes();
+            id += 1;
+        }
+        let mut i = 0;
+        while i < self.links.len() {
+            let link = &mut self.links[i];
+            match (
+                name_map.get(&link.from_segment),
+                name_map.get(&link.to_segment),
+            ) {
+                (Some(from_segment), Some(to_segment)) => {
+                    link.from_segment = from_segment.clone().into_bytes();
+                    link.to_segment = to_segment.clone().into_bytes();
+                }
+                _ => {
+                    // link points to a non existing segment
+                    self.links.swap_remove(i);
+                    continue;
+                }
+            }
+            i += 1;
+        }
     }
 }
 
@@ -259,12 +437,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("Aligning");
     dfs(&mut tree, root, None);
 
-    match tree.node_weight(root).unwrap() {
+    let Some(root_node) = tree.remove_node(root) else {
+        panic!("Root node not found");
+    };
+    match root_node {
         TreeNode::Leaf(_) => panic!("Final node is a leaf"),
         TreeNode::Empty => panic!("Final node is empty"),
         TreeNode::Internal(graph) => {
-            // post_process::post_process_graph(graph.clone(), &records);
-            graph.write(&mut stdout())?;
+            let g = post_process::post_process_graph(graph, &records);
+            g.write(&mut stdout())?;
         }
     }
 
@@ -358,7 +539,7 @@ fn extract_kmers(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
     for i in 0..seq.len() - k {
         // make kmer canonical
         let kmer = &seq[i..i + k];
-        let rc = revcomp_bytes(kmer);
+        let rc = revcomp(kmer);
         // pick lexicographically smaller
         let canonical = if kmer <= rc.as_slice() {
             kmer.to_vec()
@@ -370,8 +551,9 @@ fn extract_kmers(seq: &[u8], k: usize) -> HashSet<Vec<u8>> {
     }
     kmers
 }
-fn revcomp_bytes(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
+fn revcomp(seq: impl AsRef<[u8]>) -> Vec<u8> {
+    seq.as_ref()
+        .iter()
         .rev()
         .map(|&b| match b {
             b'A' | b'a' => b'T',
@@ -381,10 +563,6 @@ fn revcomp_bytes(seq: &[u8]) -> Vec<u8> {
             other => other,
         })
         .collect()
-}
-
-fn revcomp_str(seq: &str) -> String {
-    String::from_utf8(revcomp_bytes(seq.as_bytes())).unwrap()
 }
 
 #[derive(Debug, Clone)]
