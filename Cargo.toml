@@ -20,4 +20,4 @@ rayon = "1.10.0"
 russcip = { version = "0.8.2", features = ["bundled"] }
 speedytree = "0.1.0"
 tempfile = "3.21.0"
-rs-gax = {path = "../rs-gax"}
+rs-gax = {path = "rs-gax"}
