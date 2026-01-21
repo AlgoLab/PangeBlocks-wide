@@ -34,6 +34,8 @@ struct Args {
     graph: Option<String>,
     #[arg(long)]
     minigraph_only: bool,
+    #[arg(long)]
+    no_postprocess: bool,
 }
 
 type Graph = GFA<Vec<u8>, Vec<OptField>>;
@@ -381,7 +383,11 @@ type Tree = petgraph::Graph<TreeNode, f64, Undirected>;
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let Args {
-        fasta, k, graph, minigraph_only, ..
+        fasta,
+        k,
+        graph,
+        minigraph_only,
+        no_postprocess,
     } = args;
 
     let data = fasta::Reader::from_file(&fasta)?;
@@ -446,8 +452,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         TreeNode::Leaf(_) => panic!("Final node is a leaf"),
         TreeNode::Empty => panic!("Final node is empty"),
         TreeNode::Internal(graph) => {
-            let g = post_process::post_process_graph(graph, &records);
-            g.write(&mut stdout())?;
+            if no_postprocess {
+                graph.write(&mut stdout())?;
+            } else {
+                let g = post_process::post_process_graph(graph, &records);
+                g.write(&mut stdout())?;
+            }
         }
     }
 
