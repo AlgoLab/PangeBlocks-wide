@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-FASTA="ecoli50.fasta"
+FASTA="ecoli50.fa"
 K=20
 OUT_DIR="out"
 
@@ -13,13 +13,13 @@ cargo run -r -- \
   --fasta "$FASTA" \
   -k "$K" \
   --minigraph-only \
-  --no_postprocess \
+  --no-postprocess \
   >"$OUT_DIR/minigraph_only.gfa"
 
 echo "Running: normal"
 cargo run -r -- \
   --fasta "$FASTA" \
   -k "$K" \
-  --no_postprocess \
+  --no-postprocess \
   >"$OUT_DIR/normal.gfa"
 
