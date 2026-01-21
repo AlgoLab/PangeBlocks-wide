@@ -9,7 +9,7 @@ use tempfile::NamedTempFile;
 
 use crate::{Graph, GraphExt};
 
-pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
+pub fn align_graph(a: &Graph, b: &Graph, minigraph_only: bool) -> Graph {
     // choose a representative sequence from graph a
     let repr_path = a.longest_path_oriented();
     let repr = a.reconstruct_path_seq(&repr_path);
@@ -22,6 +22,10 @@ pub fn align_graph(a: &Graph, b: &Graph) -> Graph {
     // call minigraph and parse the output
     let mut graph: Graph = align_seq_graph(&repr, b);
     eprintln!("Minigraph is done building the graph");
+
+    if minigraph_only {
+        return graph;
+    }
 
     let temp_dir = tempfile::tempdir().unwrap();
 

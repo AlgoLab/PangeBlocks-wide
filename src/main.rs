@@ -32,6 +32,8 @@ struct Args {
     k: usize,
     #[arg(long, short)]
     graph: Option<String>,
+    #[arg(long)]
+    minigraph_only: bool,
 }
 
 type Graph = GFA<Vec<u8>, Vec<OptField>>;
@@ -379,7 +381,7 @@ type Tree = petgraph::Graph<TreeNode, f64, Undirected>;
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let Args {
-        fasta, k, graph, ..
+        fasta, k, graph, minigraph_only, ..
     } = args;
 
     let data = fasta::Reader::from_file(&fasta)?;
@@ -435,7 +437,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     eprintln!("Aligning");
-    dfs(&mut tree, root, None);
+    dfs(&mut tree, root, None, minigraph_only);
 
     let Some(root_node) = tree.remove_node(root) else {
         panic!("Root node not found");
@@ -452,14 +454,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn dfs(tree: &mut Tree, node: NodeIndex, parent: Option<NodeIndex>) {
+fn dfs(tree: &mut Tree, node: NodeIndex, parent: Option<NodeIndex>, minigraph_only: bool) {
     let children: Vec<_> = tree
         .neighbors(node)
         .filter(|&n| Some(n) != parent)
         .collect();
 
     for &child in &children {
-        dfs(tree, child, Some(node));
+        dfs(tree, child, Some(node), minigraph_only);
     }
 
     let new_graph = {
@@ -470,14 +472,18 @@ fn dfs(tree: &mut Tree, node: NodeIndex, parent: Option<NodeIndex>) {
                 if children.len() == 2 {
                     let child1 = tree.node_weight(children[0]).unwrap().clone();
                     let child2 = tree.node_weight(children[1]).unwrap().clone();
-                    Some(align(&child1, &child2))
+                    Some(align(&child1, &child2, minigraph_only))
                 } else if children.len() == 3 {
                     let child1 = tree.node_weight(children[0]).unwrap().clone();
                     let child2 = tree.node_weight(children[1]).unwrap().clone();
                     let child3 = tree.node_weight(children[2]).unwrap().clone();
 
-                    let new_graph = align(&child1, &child2);
-                    Some(align(&TreeNode::Internal(new_graph), &child3))
+                    let new_graph = align(&child1, &child2, minigraph_only);
+                    Some(align(
+                        &TreeNode::Internal(new_graph),
+                        &child3,
+                        minigraph_only,
+                    ))
                 } else {
                     unreachable!()
                 }
@@ -489,7 +495,7 @@ fn dfs(tree: &mut Tree, node: NodeIndex, parent: Option<NodeIndex>) {
     }
 }
 
-fn align(a: &TreeNode, b: &TreeNode) -> Graph {
+fn align(a: &TreeNode, b: &TreeNode, minigraph_only: bool) -> Graph {
     match (a, b) {
         (TreeNode::Empty, _) | (_, TreeNode::Empty) => unreachable!(),
         (TreeNode::Leaf(a), TreeNode::Internal(b)) | (TreeNode::Internal(b), TreeNode::Leaf(a)) => {
@@ -498,7 +504,7 @@ fn align(a: &TreeNode, b: &TreeNode) -> Graph {
         }
         (TreeNode::Internal(a), TreeNode::Internal(b)) => {
             eprintln!("Graph Graph alignment");
-            minigraph::align_graph(a, b)
+            minigraph::align_graph(a, b, minigraph_only)
         }
         (TreeNode::Leaf(a), TreeNode::Leaf(b)) => {
             eprintln!("Sequence Sequence alignment");
